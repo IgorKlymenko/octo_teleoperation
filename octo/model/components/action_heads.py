@@ -17,6 +17,8 @@ from octo.model.components.transformer import MAPHead
 from octo.model.components.unet import ConditionalUnet1D, unet_squaredcos_cap_v2
 from octo.utils.typing import PRNGKey
 
+import tensorflow_probability.substrates.jax as tfp
+
 
 class ActionHead(ABC):
     """Action prediction modules that take in the transformer token outputs and predict actions.
@@ -850,3 +852,284 @@ class UNetDDPMActionHead(nn.Module):
         )
 
         return noisy_action
+
+class TeleoperationActionHead(nn.Module, ActionHead):
+    """Predicts actions using a teleoperation model with Gaussian distribution.
+
+    This action head predicts a Gaussian distribution over actions with zero mean and
+    learned covariance. It uses the negative log probability of the ground truth actions
+    under this zero-mean Gaussian distribution as the loss function. This allows the model
+    to capture uncertainty (variance) in action predictions while assuming actions are
+    centered at zero.
+
+    You may create an embedding by either mean-pooling across tokens (use_map=False) or using
+    multi-head attention pooling (use_map=True). It is recommended to use MAP when decoding
+    from the observation token stream.
+    """
+
+    readout_key: str
+    use_map: bool = False
+    action_horizon: int = 1
+    action_dim: int = 7
+    max_action: float = 5.0
+    # Minimum value for diagonal covariance to ensure numerical stability
+    min_cov_diag: float = 1e-3
+
+    def setup(self):
+        """Initialize the action head components.
+        
+        Creates:
+        - MAP head for attention pooling (if use_map=True)
+        - Dense layer to predict action covariance matrix parameters
+        Note: Mean is assumed to be zero, so no mean prediction layer is needed.
+        """
+        if self.use_map:
+            self.map_head = MAPHead()
+        
+        # Predict parameters for the covariance matrix only (mean is assumed to be zero)
+        # For a full covariance matrix, we need action_dim * action_dim parameters per timestep
+        # We'll predict a lower triangular matrix and construct the covariance from it
+        # Number of parameters in lower triangular matrix: action_dim * (action_dim + 1) / 2
+        n_cov_params = self.action_horizon * self.action_dim * (self.action_dim + 1) // 2
+        self.cov_proj = nn.Dense(n_cov_params)
+
+    def __call__(
+        self, transformer_outputs: Dict[str, TokenGroup], train: bool = True
+    ) -> Tuple[jax.Array, jax.Array]:
+        """
+        Predicts the covariance of a Gaussian distribution over actions (mean is zero).
+        
+        Args:
+            transformer_outputs: Dictionary containing token groups from transformer
+            train: Whether in training mode
+            
+        Returns:
+            mean: Zero mean w/ shape (batch_size, window_size, action_horizon, action_dim)
+            cov: Predicted action covariance matrices w/ shape 
+                 (batch_size, window_size, action_horizon, action_dim, action_dim)
+        """
+        token_group = transformer_outputs[self.readout_key]
+        assert token_group.tokens.ndim == 4, (
+            f"Expected token_group.tokens to have shape (batch_size, window_size, num_tokens, embedding_size), "
+            f"but got shape {token_group.tokens.shape}"
+        )
+        
+        # Extract embeddings from transformer outputs
+        if self.use_map:  # Multi-head attention pooling
+            embeddings = self.map_head(token_group, train=train)[:, :, 0]
+        else:  # mean pooling
+            embeddings = token_group.tokens.mean(axis=-2)
+        # (batch_size, window_size, embedding_size)
+
+        # Mean is assumed to be zero
+        batch_size, window_size = embeddings.shape[:2]
+        mean = jnp.zeros((batch_size, window_size, self.action_horizon, self.action_dim))
+
+        # Predict covariance matrix parameters
+        # We predict a lower triangular matrix L such that cov = L @ L.T
+        # This ensures the covariance matrix is positive semi-definite
+        cov_params_flat = self.cov_proj(embeddings)
+        
+        # Reshape to get lower triangular matrices for each timestep
+        # Shape: (batch_size, window_size, action_horizon, action_dim, action_dim)
+        cov_matrices = []
+        for h in range(self.action_horizon):
+            # Extract parameters for this horizon
+            start_idx = h * self.action_dim * (self.action_dim + 1) // 2
+            end_idx = (h + 1) * self.action_dim * (self.action_dim + 1) // 2
+            cov_params_h = cov_params_flat[:, :, start_idx:end_idx]
+            
+            # Construct lower triangular matrix
+            # We use a parameterization where we predict the lower triangular part
+            L = jnp.zeros((batch_size, window_size, self.action_dim, self.action_dim))
+            idx = 0
+            for i in range(self.action_dim):
+                for j in range(i + 1):
+                    L = L.at[:, :, i, j].set(cov_params_h[:, :, idx])
+                    idx += 1
+            
+            # Construct covariance matrix: cov = L @ L.T + min_cov_diag * I
+            # This ensures positive definiteness and numerical stability
+            cov_h = jnp.matmul(L, jnp.transpose(L, (0, 1, 3, 2)))
+            cov_h = cov_h + self.min_cov_diag * jnp.eye(self.action_dim)[None, None, :, :]
+            cov_matrices.append(cov_h)
+        
+        # Stack along action_horizon dimension
+        cov = jnp.stack(cov_matrices, axis=2)
+        # Final shape: (batch_size, window_size, action_horizon, action_dim, action_dim)
+
+        return mean, cov
+
+    def loss(
+        self,
+        transformer_outputs: Dict[str, TokenGroup],
+        actions: ArrayLike,
+        timestep_pad_mask: ArrayLike,
+        action_pad_mask: ArrayLike,
+        train: bool = True,
+    ) -> Tuple[Array, Dict[str, Array]]:
+        """Computes the negative log probability loss for the zero-mean Gaussian action distribution.
+
+        The loss is the negative log probability of the ground truth actions under the
+        predicted zero-mean Gaussian distribution. This allows the model to learn the
+        uncertainty (covariance) of actions while assuming the mean is zero.
+
+        Args:
+            transformer_outputs: must contain self.readout_key with shape 
+                (batch_size, window_size, num_tokens, embedding_size)
+            actions: shape (batch_size, window_size, action_horizon, action_dim)
+            timestep_pad_mask: boolean array (batch, window_size) which is True if the 
+                timestep is not a padding timestep
+            action_pad_mask: boolean array (same shape as actions) which is True if the 
+                action dimension is not a padding dimension
+
+        Returns:
+            loss: scalar loss value (negative log probability, masked and averaged)
+            metrics: dict containing loss, mse (mean squared error of actions from zero), and other metrics
+        """
+        # Predict covariance of action distribution (mean is zero)
+        # mean: (batch_size, window_size, action_horizon, action_dim) - all zeros
+        # cov: (batch_size, window_size, action_horizon, action_dim, action_dim)
+        mean, cov = self(transformer_outputs, train=train)
+
+        # Combine the timestep pad mask with the action pad mask
+        # mask: (batch_size, window_size, action_horizon, action_dim)
+        mask = timestep_pad_mask[:, :, None, None] & action_pad_mask
+
+        # Compute negative log probability for each action dimension
+        # We'll compute log probability per timestep and action dimension
+        batch_size, window_size, action_horizon, action_dim = actions.shape
+        
+        # Reshape for per-timestep, per-horizon computation
+        # Flatten batch and window dimensions for easier processing
+        actions_flat = actions.reshape(-1, action_horizon, action_dim)
+        mean_flat = mean.reshape(-1, action_horizon, action_dim)
+        cov_flat = cov.reshape(-1, action_horizon, action_dim, action_dim)
+        mask_flat = mask.reshape(-1, action_horizon, action_dim)
+        
+        # Compute log probabilities for each (batch*window, horizon) pair
+        total_log_probs = []
+        for h in range(action_horizon):
+            # Get actions, mean (zero), and cov for this horizon
+            actions_h = actions_flat[:, h, :]  # (batch*window, action_dim)
+            mean_h = mean_flat[:, h, :]  # (batch*window, action_dim) - all zeros
+            cov_h = cov_flat[:, h, :, :]  # (batch*window, action_dim, action_dim)
+            mask_h = mask_flat[:, h, :]  # (batch*window, action_dim)
+            
+            # Create multivariate normal distribution with zero mean for each sample
+            # We need to handle masking: only compute log prob for valid action dimensions
+            # For simplicity, we'll compute log prob for all dimensions and then mask
+            dist = tfp.distributions.MultivariateNormalFullCovariance(
+                loc=mean_h, covariance_matrix=cov_h
+            )
+            log_probs_h = dist.log_prob(actions_h)  # (batch*window,)
+            
+            # Apply mask: only consider timesteps where at least one action dim is valid
+            valid_mask = mask_h.any(axis=-1)  # (batch*window,)
+            log_probs_h = jnp.where(valid_mask, log_probs_h, 0.0)
+            total_log_probs.append(log_probs_h)
+        
+        # Stack log probabilities across horizons
+        # Shape: (batch*window, action_horizon)
+        log_probs = jnp.stack(total_log_probs, axis=-1)
+        
+        # Average across action horizons (each horizon contributes equally)
+        log_probs = jnp.mean(log_probs, axis=-1)  # (batch*window,)
+        
+        # Reshape back to (batch_size, window_size)
+        log_probs = log_probs.reshape(batch_size, window_size)
+        
+        # Apply timestep mask
+        log_probs = jnp.where(timestep_pad_mask, log_probs, 0.0)
+        
+        # Compute negative log probability as loss
+        # We sum over valid timesteps and divide by number of valid timesteps
+        n_valid = jnp.sum(timestep_pad_mask)
+        loss = -jnp.sum(log_probs) / jnp.clip(n_valid, a_min=1.0)
+        
+        # Also compute MSE for monitoring (mean squared error of actions from zero)
+        # Since mean is zero, this measures how far actions are from zero
+        mse = jnp.square(actions)  # actions - 0 = actions
+        mse = masked_mean(mse, mask)
+        
+        # Scale by action_dim to match other action heads
+        loss = loss * self.action_dim
+        mse = mse * self.action_dim
+        
+        metrics = {
+            "loss": loss,
+            "mse": mse,
+            "nll": loss,  # Negative log likelihood (same as loss)
+        }
+        
+        return loss, metrics
+
+
+    ## Do not actually need, but is here
+    def predict_action(
+        self,
+        transformer_outputs: Dict[str, TokenGroup],
+        train: bool = False,
+        argmax: bool = False,
+        sample_shape: Tuple[int, ...] = (),
+        rng: Optional[PRNGKey] = None,
+        temperature: float = 1.0,
+        embodiment_action_dim: Optional[int] = None,
+    ) -> Array:
+        """Predict actions by sampling from the predicted zero-mean Gaussian distribution.
+
+        For the last timestep in the window, samples actions from the predicted
+        zero-mean Gaussian distribution. If argmax=True, returns zero (the mean/mode).
+
+        Args:
+            transformer_outputs: Dictionary containing token groups from transformer
+            train: Whether in training mode
+            argmax: If True, return zero (the mean/mode) instead of sampling
+            sample_shape: Shape for additional samples (e.g., (n_samples,) for n_samples samples)
+            rng: Random number generator key for sampling
+            temperature: Temperature for sampling (scales the covariance)
+            embodiment_action_dim: Optional action dimension for masking
+
+        Returns:
+            actions: Sampled actions or zeros w/ shape (*sample_shape, batch_size, action_horizon, action_dim)
+        """
+        # Predict covariance for the last timestep (mean is zero)
+        mean, cov = self(transformer_outputs, train=train)
+        # Get only the last timestep
+        mean_last = mean[:, -1]  # (batch_size, action_horizon, action_dim) - all zeros
+        cov_last = cov[:, -1]  # (batch_size, action_horizon, action_dim, action_dim)
+
+        if argmax:
+            # Return zero (the mean/mode of the zero-mean distribution)
+            actions = jnp.broadcast_to(mean_last, sample_shape + mean_last.shape)
+        else:
+            # Sample from the zero-mean Gaussian distribution
+            if rng is None:
+                raise ValueError("rng must be provided for sampling")
+            
+            # Scale covariance by temperature
+            cov_scaled = cov_last * (temperature ** 2)
+            
+            # Sample for each horizon
+            batch_size = mean_last.shape[0]
+            samples = []
+            rng_current = rng
+            for h in range(self.action_horizon):
+                mean_h = mean_last[:, h, :]  # (batch_size, action_dim) - all zeros
+                cov_h = cov_scaled[:, h, :, :]  # (batch_size, action_dim, action_dim)
+                
+                # Create zero-mean distribution and sample
+                dist = tfp.distributions.MultivariateNormalFullCovariance(
+                    loc=mean_h, covariance_matrix=cov_h
+                )
+                # Split RNG for this horizon
+                rng_current, rng_h = jax.random.split(rng_current)
+                sample_h = dist.sample(seed=rng_h, sample_shape=sample_shape)
+                # sample_h shape: (*sample_shape, batch_size, action_dim)
+                samples.append(sample_h)
+            
+            # Stack along action_horizon dimension
+            # Shape: (*sample_shape, batch_size, action_horizon, action_dim)
+            actions = jnp.stack(samples, axis=-2)
+        
+        return actions
