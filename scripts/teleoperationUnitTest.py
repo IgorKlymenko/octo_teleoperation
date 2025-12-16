@@ -1,8 +1,8 @@
 import jax
+import jax.numpy as jnp
 from octo.model.components.action_heads import TeleoperationActionHead
 from octo.model.components.base import TokenGroup
 
-# Quick smoke test
 action_head = TeleoperationActionHead(
     readout_key="readout_action",
     action_horizon=1,
@@ -10,11 +10,13 @@ action_head = TeleoperationActionHead(
     use_map=False,
 )
 
-# Create dummy inputs
-dummy_tokens = jax.numpy.ones((2, 1, 10, 128))  # (batch, window, tokens, embedding)
-transformer_outputs = {"readout_action": TokenGroup(tokens=dummy_tokens)}
+dummy_tokens = jnp.ones((2, 1, 10, 128))        # (batch, window, tokens, embed)
+dummy_mask   = jnp.ones((2, 1, 10), dtype=bool) # (batch, window, tokens)
 
-# Test initialization and forward pass
+transformer_outputs = {
+    "readout_action": TokenGroup(tokens=dummy_tokens, mask=dummy_mask)
+}
+
 variables = action_head.init(jax.random.PRNGKey(0), transformer_outputs, train=True)
 bound_head = action_head.bind(variables)
 mean, cov = bound_head(transformer_outputs, train=True)
