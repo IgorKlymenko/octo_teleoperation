@@ -17,6 +17,8 @@ from octo.utils.train_utils import (
     process_text,
     TrainState,
 )
+import os
+from clu import metric_writers
 
 FLAGS = flags.FLAGS
 
@@ -25,7 +27,7 @@ flags.DEFINE_string(
 )
 flags.DEFINE_string("data_dir", None, "Path to finetuning dataset, in RLDS format.")
 flags.DEFINE_string("save_dir", None, "Directory for saving finetuning checkpoints.")
-flags.DEFINE_integer("batch_size", 128, "Batch size for finetuning.")
+flags.DEFINE_integer("batch_size", 32, "Batch size for finetuning.")
 
 flags.DEFINE_bool(
     "freeze_transformer",
@@ -46,6 +48,10 @@ def main(_):
     logging.info("Loading pre-trained model...")
     pretrained_model = OctoModel.load_pretrained(FLAGS.pretrained_path)
 
+
+    tb_writer = metric_writers.create_default_writer(
+        logdir=os.path.join(os.path.abspath(FLAGS.save_dir), "tb")
+    )
     # make finetuning dataset
     logging.info("Loading finetuning dataset...")
     dataset = make_single_dataset(
@@ -166,7 +172,7 @@ def main(_):
 
     # run finetuning loop
     logging.info("Starting finetuning...")
-    for i in tqdm.tqdm(range(5000), total=5000, dynamic_ncols=True):
+    for i in tqdm.tqdm(range(1000), total=1000, dynamic_ncols=True):
         batch = next(train_data_iter)
         train_state, update_info = train_step(train_state, batch)
         if (i + 1) % 100 == 0:
@@ -175,6 +181,20 @@ def main(_):
         if (i + 1) % 1000 == 0:
             # save checkpoint
             train_state.model.save_pretrained(step=i, checkpoint_path=FLAGS.save_dir)
+
+        if (i + 1) % 10 == 0:
+            info_host = jax.device_get(update_info)
+
+            scalars = {}
+            for k, v in info_host.items():
+                if hasattr(v, "shape") and v.shape != ():
+                    continue
+                try:
+                    scalars[k] = float(v)
+                except Exception:
+                    pass
+
+            tb_writer.write_scalars(i + 1, scalars)
 
 
 if __name__ == "__main__":
