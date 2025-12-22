@@ -513,7 +513,7 @@ class DiffusionActionHead(nn.Module):
             transformer_outputs, train=train, time=time, noisy_actions=noisy_actions
         )
 
-        # combine the timestep pad mask with the action pad mask
+        # combine the timestep pad `mask with the action pad mask
         mask = timestep_pad_mask[:, :, None, None] & action_pad_mask
         # flatten the mask to match the flat actions
         mask = rearrange(mask, "b w h a -> b w (h a)")
