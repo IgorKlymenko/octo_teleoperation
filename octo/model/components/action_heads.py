@@ -857,10 +857,14 @@ class TeleoperationActionHead(nn.Module, ActionHead):
     """Predicts actions using a teleoperation model with Gaussian distribution.
 
     This action head predicts a Gaussian distribution over actions with zero mean and
-    learned covariance. It uses the negative log probability of the ground truth actions
-    under this zero-mean Gaussian distribution as the loss function. This allows the model
-    to capture uncertainty (variance) in action predictions while assuming actions are
-    centered at zero.
+    a single learned covariance matrix that applies to all actions in the horizon.
+    It uses the negative log probability of the ground truth actions under this zero-mean
+    Gaussian distribution as the loss function. This allows the model to capture uncertainty
+    (variance) in action predictions while assuming actions are centered at zero.
+
+    The covariance matrix is predicted once per timestep and shared across all action_horizon
+    steps, making it more parameter-efficient than predicting separate covariances for each
+    horizon step.
 
     You may create an embedding by either mean-pooling across tokens (use_map=False) or using
     multi-head attention pooling (use_map=True). It is recommended to use MAP when decoding
@@ -886,18 +890,20 @@ class TeleoperationActionHead(nn.Module, ActionHead):
         if self.use_map:
             self.map_head = MAPHead()
         
-        # Predict parameters for the covariance matrix only (mean is assumed to be zero)
-        # For a full covariance matrix, we need action_dim * action_dim parameters per timestep
+        # Predict parameters for a single covariance matrix that applies to all actions in the horizon
+        # (mean is assumed to be zero)
         # We'll predict a lower triangular matrix and construct the covariance from it
         # Number of parameters in lower triangular matrix: action_dim * (action_dim + 1) / 2
-        n_cov_params = self.action_horizon * self.action_dim * (self.action_dim + 1) // 2
+        # This single covariance matrix will be shared across all action_horizon steps
+        n_cov_params = self.action_dim * (self.action_dim + 1) // 2
         self.cov_proj = nn.Dense(n_cov_params)
 
     def __call__(
         self, transformer_outputs: Dict[str, TokenGroup], train: bool = True
     ) -> Tuple[jax.Array, jax.Array]:
         """
-        Predicts the covariance of a Gaussian distribution over actions (mean is zero).
+        Predicts a single covariance matrix for a Gaussian distribution over actions (mean is zero).
+        The same covariance matrix is shared across all actions in the horizon.
         
         Args:
             transformer_outputs: Dictionary containing token groups from transformer
@@ -907,6 +913,7 @@ class TeleoperationActionHead(nn.Module, ActionHead):
             mean: Zero mean w/ shape (batch_size, window_size, action_horizon, action_dim)
             cov: Predicted action covariance matrices w/ shape 
                  (batch_size, window_size, action_horizon, action_dim, action_dim)
+                 Note: The same covariance matrix is broadcast across all action_horizon steps
         """
         token_group = transformer_outputs[self.readout_key]
         assert token_group.tokens.ndim == 4, (
@@ -925,37 +932,32 @@ class TeleoperationActionHead(nn.Module, ActionHead):
         batch_size, window_size = embeddings.shape[:2]
         mean = jnp.zeros((batch_size, window_size, self.action_horizon, self.action_dim))
 
-        # Predict covariance matrix parameters
+        # Predict covariance matrix parameters (single prediction for entire horizon)
         # We predict a lower triangular matrix L such that cov = L @ L.T
         # This ensures the covariance matrix is positive semi-definite
         cov_params_flat = self.cov_proj(embeddings)
+        # cov_params_flat shape: (batch_size, window_size, n_cov_params)
         
-        # Reshape to get lower triangular matrices for each timestep
-        # Shape: (batch_size, window_size, action_horizon, action_dim, action_dim)
-        cov_matrices = []
-        for h in range(self.action_horizon):
-            # Extract parameters for this horizon
-            start_idx = h * self.action_dim * (self.action_dim + 1) // 2
-            end_idx = (h + 1) * self.action_dim * (self.action_dim + 1) // 2
-            cov_params_h = cov_params_flat[:, :, start_idx:end_idx]
-            
-            # Construct lower triangular matrix
-            # We use a parameterization where we predict the lower triangular part
-            L = jnp.zeros((batch_size, window_size, self.action_dim, self.action_dim))
-            idx = 0
-            for i in range(self.action_dim):
-                for j in range(i + 1):
-                    L = L.at[:, :, i, j].set(cov_params_h[:, :, idx])
-                    idx += 1
-            
-            # Construct covariance matrix: cov = L @ L.T + min_cov_diag * I
-            # This ensures positive definiteness and numerical stability
-            cov_h = jnp.matmul(L, jnp.transpose(L, (0, 1, 3, 2)))
-            cov_h = cov_h + self.min_cov_diag * jnp.eye(self.action_dim)[None, None, :, :]
-            cov_matrices.append(cov_h)
+        # Construct lower triangular matrix from parameters
+        # We use a parameterization where we predict the lower triangular part
+        L = jnp.zeros((batch_size, window_size, self.action_dim, self.action_dim))
+        idx = 0
+        for i in range(self.action_dim):
+            for j in range(i + 1):
+                L = L.at[:, :, i, j].set(cov_params_flat[:, :, idx])
+                idx += 1
         
-        # Stack along action_horizon dimension
-        cov = jnp.stack(cov_matrices, axis=2)
+        # Construct single covariance matrix: cov = L @ L.T + min_cov_diag * I
+        # This ensures positive definiteness and numerical stability
+        cov_single = jnp.matmul(L, jnp.transpose(L, (0, 1, 3, 2)))
+        cov_single = cov_single + self.min_cov_diag * jnp.eye(self.action_dim)[None, None, :, :]
+        # cov_single shape: (batch_size, window_size, action_dim, action_dim)
+        
+        # Broadcast the single covariance matrix across all action_horizon steps
+        cov = jnp.broadcast_to(
+            cov_single[:, :, None, :, :],
+            (batch_size, window_size, self.action_horizon, self.action_dim, self.action_dim)
+        )
         # Final shape: (batch_size, window_size, action_horizon, action_dim, action_dim)
 
         return mean, cov
