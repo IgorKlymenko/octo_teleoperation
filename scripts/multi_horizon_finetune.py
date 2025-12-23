@@ -32,6 +32,26 @@ flags.DEFINE_string(
     "pretrained_path", None, "Path to pre-trained Octo checkpoint directory."
 )
 flags.DEFINE_string("data_dir", None, "Path to finetuning dataset, in RLDS format.")
+flags.DEFINE_string(
+    "dataset_name",
+    "aloha_sim_cube_scripted_dataset",
+    "Name of the dataset to use (must match your dataset registration).",
+)
+flags.DEFINE_string(
+    "image_obs_key",
+    "primary",
+    "Key for image observations in the dataset.",
+)
+flags.DEFINE_string(
+    "proprio_obs_key",
+    "state",
+    "Key for proprioceptive observations in the dataset.",
+)
+flags.DEFINE_string(
+    "language_key",
+    "language_instruction",
+    "Key for language instructions in the dataset.",
+)
 flags.DEFINE_string("base_save_dir", None, "Base directory for saving finetuning checkpoints.")
 flags.DEFINE_integer("batch_size", 32, "Batch size for finetuning.")
 flags.DEFINE_list(
@@ -50,6 +70,10 @@ flags.DEFINE_bool(
 def finetune_for_horizon(
     pretrained_model,
     data_dir,
+    dataset_name,
+    image_obs_key,
+    proprio_obs_key,
+    language_key,
     save_dir,
     action_horizon,
     batch_size,
@@ -70,11 +94,11 @@ def finetune_for_horizon(
     logging.info("Loading finetuning dataset...")
     dataset = make_single_dataset(
         dataset_kwargs=dict(
-            name="aloha_sim_cube_scripted_dataset",
+            name=dataset_name,
             data_dir=data_dir,
-            image_obs_keys={"primary": "top"},
-            proprio_obs_key="state",
-            language_key="language_instruction",
+            image_obs_keys={"primary": image_obs_key},
+            proprio_obs_key=proprio_obs_key,
+            language_key=language_key,
         ),
         traj_transform_kwargs=dict(
             window_size=1,
@@ -238,6 +262,10 @@ def main(_):
         finetune_for_horizon(
             pretrained_model=pretrained_model,
             data_dir=FLAGS.data_dir,
+            dataset_name=FLAGS.dataset_name,
+            image_obs_key=FLAGS.image_obs_key,
+            proprio_obs_key=FLAGS.proprio_obs_key,
+            language_key=FLAGS.language_key,
             save_dir=save_dir,
             action_horizon=action_horizon,
             batch_size=FLAGS.batch_size,

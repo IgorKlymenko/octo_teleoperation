@@ -8,6 +8,7 @@ Total runs: num_training_horizons * num_prediction_horizons
 
 from absl import app, flags, logging
 import jax
+import jax.numpy as jnp
 import numpy as np
 import os
 import json
@@ -67,8 +68,27 @@ def run_predictions_for_model(
     logging.info(f"Loading model from {model_path}")
     model = OctoModel.load_pretrained(model_path)
     
-    # Create dataset with prediction horizon
-    logging.info("Loading dataset...")
+    # Inspect model's expected observation format
+    example_obs = model.example_batch["observation"]
+    logging.info(f"Model expects observations with keys: {list(example_obs.keys())}")
+    for key, value in example_obs.items():
+        if hasattr(value, 'shape'):
+            logging.info(f"  {key}: shape {value.shape}")
+        else:
+            logging.info(f"  {key}: {type(value)}")
+    
+    # Get expected window_size from example batch
+    first_obs_value = next(iter(example_obs.values()))
+    if hasattr(first_obs_value, 'shape') and len(first_obs_value.shape) >= 2:
+        expected_window_size = first_obs_value.shape[1]
+        logging.info(f"Model expects window_size={expected_window_size}")
+    else:
+        expected_window_size = 1
+        logging.warning("Could not determine expected window_size, defaulting to 1")
+    
+    # Create dataset with TRAINING horizon to match model's expected observation shapes
+    # The model was trained with training_horizon, so observations must match that
+    logging.info("Loading dataset with training horizon to match model expectations...")
     dataset = make_single_dataset(
         dataset_kwargs=dict(
             name="aloha_sim_cube_scripted_dataset",
@@ -78,8 +98,8 @@ def run_predictions_for_model(
             language_key="language_instruction",
         ),
         traj_transform_kwargs=dict(
-            window_size=1,
-            action_horizon=prediction_horizon,
+            window_size=expected_window_size,  # Match model's expected window_size
+            action_horizon=training_horizon,  # Use training horizon for dataset
         ),
         frame_transform_kwargs=dict(
             resize_size={"primary": (256, 256)},
@@ -87,12 +107,42 @@ def run_predictions_for_model(
         train=False,  # Use validation/test split
     )
     
-    # Get dataset iterator
+    # Also create dataset with prediction horizon for ground truth comparison
+    logging.info("Loading dataset with prediction horizon for ground truth...")
+    dataset_pred = make_single_dataset(
+        dataset_kwargs=dict(
+            name="aloha_sim_cube_scripted_dataset",
+            data_dir=data_dir,
+            image_obs_keys={"primary": "top"},
+            proprio_obs_key="state",
+            language_key="language_instruction",
+        ),
+        traj_transform_kwargs=dict(
+            window_size=expected_window_size,  # Match model's expected window_size
+            action_horizon=prediction_horizon,  # Use prediction horizon for ground truth
+        ),
+        frame_transform_kwargs=dict(
+            resize_size={"primary": (256, 256)},
+        ),
+        train=False,
+    )
+    
+    # Get dataset iterators - ensure they're aligned by using same seed/order
+    # Both datasets should produce trajectories in the same order since they use the same source
     data_iter = (
         dataset.take(num_trajectories)
         .batch(batch_size)
         .iterator()
     )
+    
+    data_iter_pred = (
+        dataset_pred.take(num_trajectories)
+        .batch(batch_size)
+        .iterator()
+    )
+    
+    # Note: We assume both datasets produce trajectories in the same order
+    # since they use the same data source and configuration (except action_horizon)
     
     # Collect predictions and ground truth
     all_predictions = []
@@ -102,9 +152,42 @@ def run_predictions_for_model(
     rng = jax.random.PRNGKey(42)
     
     logging.info(f"Running predictions on {num_trajectories} trajectories...")
-    for batch_idx, batch in enumerate(data_iter):
-        # Process observations
+    for batch_idx, (batch, batch_pred) in enumerate(zip(data_iter, data_iter_pred)):
+        # Process observations (use training horizon dataset for model input)
         observations = batch["observation"]
+        
+        # Ensure observations match model's expected format
+        # Filter to only include keys that the model expects
+        expected_obs_keys = set(model.example_batch["observation"].keys())
+        actual_obs_keys = set(observations.keys())
+        
+        # Check for missing keys
+        missing_keys = expected_obs_keys - actual_obs_keys
+        if missing_keys:
+            logging.warning(f"Observations missing keys: {missing_keys}. This may cause errors.")
+        
+        # Filter observations to match expected format
+        filtered_observations = {}
+        for key in expected_obs_keys:
+            if key in observations:
+                filtered_observations[key] = observations[key]
+            else:
+                # Use example batch value as fallback (this might not work for all cases)
+                logging.warning(f"Key {key} not in observations, using example batch value")
+                example_value = model.example_batch["observation"][key]
+                # Convert to numpy and broadcast to match batch size
+                if hasattr(example_value, 'shape'):
+                    example_np = np.array(example_value)
+                    batch_size = list(observations.values())[0].shape[0] if observations else 1
+                    # Broadcast to match batch size
+                    filtered_observations[key] = np.broadcast_to(
+                        example_np[None, ...],
+                        (batch_size,) + example_np.shape
+                    )
+                else:
+                    filtered_observations[key] = np.array(example_value) if hasattr(example_value, '__array__') else example_value
+        
+        observations = filtered_observations
         
         # Create tasks (using language instructions from batch if available)
         if "task" in batch and "language" in batch["task"]:
@@ -113,7 +196,7 @@ def run_predictions_for_model(
             # Default task if no language instruction
             tasks = model.create_tasks(texts=["perform task"])
         
-        # Sample actions
+        # Sample actions (model will predict with training_horizon)
         rng, sample_rng = jax.random.split(rng)
         predicted_actions = model.sample_actions(
             observations,
@@ -121,13 +204,36 @@ def run_predictions_for_model(
             rng=sample_rng,
             train=False,
         )
+        predicted_actions = np.array(predicted_actions)
         
-        # Get ground truth actions
-        ground_truth_actions = batch["action"]
+        # Get ground truth actions (from prediction horizon dataset)
+        ground_truth_actions = np.array(batch_pred["action"])
+        
+        # Handle horizon mismatch: if training_horizon != prediction_horizon
+        if training_horizon != prediction_horizon:
+            if training_horizon < prediction_horizon:
+                # Model predicts fewer steps - pad predictions or repeat last action
+                # For now, just take first prediction_horizon steps from ground truth
+                # and compare to repeated predictions
+                pred_shape = predicted_actions.shape  # (*sample_shape, batch, train_horizon, action_dim)
+                if len(pred_shape) == 3:  # (batch, train_horizon, action_dim)
+                    batch_size, _, action_dim = pred_shape
+                    # Repeat the last predicted action to match prediction horizon
+                    last_pred = predicted_actions[:, -1:, :]  # (batch, 1, action_dim)
+                    repeated = np.repeat(last_pred, prediction_horizon - training_horizon, axis=1)
+                    predicted_actions = np.concatenate([predicted_actions, repeated], axis=1)
+                else:
+                    # Handle sample_shape case
+                    last_pred = predicted_actions[..., -1:, :]
+                    repeated = np.repeat(last_pred, prediction_horizon - training_horizon, axis=-2)
+                    predicted_actions = np.concatenate([predicted_actions, repeated], axis=-2)
+            else:
+                # Model predicts more steps - truncate to prediction horizon
+                predicted_actions = predicted_actions[..., :prediction_horizon, :]
         
         # Store results
-        all_predictions.append(np.array(predicted_actions))
-        all_ground_truth.append(np.array(ground_truth_actions))
+        all_predictions.append(predicted_actions)
+        all_ground_truth.append(ground_truth_actions)
         all_observations.append({
             k: np.array(v) for k, v in observations.items()
         })

@@ -17,6 +17,11 @@ flags.DEFINE_string(
     "pretrained_path", None, "Path to pre-trained Octo checkpoint directory."
 )
 flags.DEFINE_string("data_dir", None, "Path to finetuning dataset, in RLDS format.")
+flags.DEFINE_string(
+    "dataset_name",
+    "aloha_sim_cube_scripted_dataset",
+    "Name of the dataset to use (must match your dataset registration).",
+)
 flags.DEFINE_string("base_save_dir", None, "Base directory for saving finetuning checkpoints.")
 flags.DEFINE_string("output_dir", None, "Directory to save prediction results.")
 flags.DEFINE_integer("batch_size", 32, "Batch size for finetuning.")
@@ -53,6 +58,7 @@ def main(_):
             os.path.join(script_dir, "multi_horizon_finetune.py"),
             f"--pretrained_path={FLAGS.pretrained_path}",
             f"--data_dir={FLAGS.data_dir}",
+            f"--dataset_name={FLAGS.dataset_name}",
             f"--base_save_dir={FLAGS.base_save_dir}",
             f"--batch_size={FLAGS.batch_size}",
             f"--action_horizons={','.join(FLAGS.action_horizons)}",
@@ -79,6 +85,7 @@ def main(_):
             os.path.join(script_dir, "multi_horizon_predict.py"),
             f"--base_model_dir={FLAGS.base_save_dir}",
             f"--data_dir={FLAGS.data_dir}",
+            f"--dataset_name={FLAGS.dataset_name}",
             f"--training_horizons={','.join(FLAGS.action_horizons)}",
             f"--prediction_horizons={','.join(FLAGS.action_horizons)}",
             f"--num_trajectories={FLAGS.num_trajectories}",
