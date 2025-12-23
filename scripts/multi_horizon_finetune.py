@@ -39,8 +39,8 @@ flags.DEFINE_string(
 )
 flags.DEFINE_string(
     "image_obs_key",
-    "primary",
-    "Key for image observations in the dataset.",
+    "top",
+    "Key name in the raw dataset for image observations (e.g., 'top', 'wrist').",
 )
 flags.DEFINE_string(
     "proprio_obs_key",
@@ -96,7 +96,7 @@ def finetune_for_horizon(
         dataset_kwargs=dict(
             name=dataset_name,
             data_dir=data_dir,
-            image_obs_keys={"primary": image_obs_key},
+            image_obs_keys={"primary": image_obs_key},  # Maps new name "primary" to dataset key
             proprio_obs_key=proprio_obs_key,
             language_key=language_key,
         ),

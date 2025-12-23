@@ -130,6 +130,25 @@ output_dir/
 ... (9 total combinations)
 ```
 
+## Visualization
+
+After running predictions, you can visualize the trajectories:
+
+```bash
+python scripts/visualize_trajectories.py \
+    --results_dir=./results/multi_horizon \
+    --output_dir=./results/multi_horizon/plots \
+    --action_dim_labels=x,y,z,roll,pitch,yaw,gripper \
+    --max_trajectories=5 \
+    --save_plots=true \
+    --show_plots=false
+```
+
+This will create:
+- Individual trajectory plots showing predicted vs ground truth for each action dimension
+- Summary plots with all dimensions in a grid layout plus MSE over time
+- All plots saved in `results_dir/train_hX_pred_hY/visualizations/`
+
 ## Notes
 
 - The teleoperation action head uses a **single covariance matrix** shared across all actions in the horizon (as modified in the codebase)

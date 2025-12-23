@@ -127,17 +127,19 @@ def run_predictions_for_model(
         train=False,
     )
     
-    # Get dataset iterators - ensure they're aligned by using same seed/order
-    # Both datasets should produce trajectories in the same order since they use the same source
+    # Get dataset iterators - unbatch trajectories to process timestep by timestep
+    # The model expects (batch, window_size, ...) but dataset returns (batch, traj_len, window_size, ...)
     data_iter = (
         dataset.take(num_trajectories)
-        .batch(batch_size)
+        .unbatch()  # Unbatch trajectories: (traj_len, window_size, ...)
+        .batch(batch_size)  # Batch timesteps: (batch, window_size, ...)
         .iterator()
     )
     
     data_iter_pred = (
         dataset_pred.take(num_trajectories)
-        .batch(batch_size)
+        .unbatch()  # Unbatch trajectories
+        .batch(batch_size)  # Batch timesteps
         .iterator()
     )
     
@@ -151,9 +153,10 @@ def run_predictions_for_model(
     
     rng = jax.random.PRNGKey(42)
     
-    logging.info(f"Running predictions on {num_trajectories} trajectories...")
+    logging.info(f"Running predictions on {num_trajectories} trajectories (processing timestep by timestep)...")
     for batch_idx, (batch, batch_pred) in enumerate(zip(data_iter, data_iter_pred)):
         # Process observations (use training horizon dataset for model input)
+        # Now observations should be (batch, window_size, ...) instead of (batch, traj_len, window_size, ...)
         observations = batch["observation"]
         
         # Ensure observations match model's expected format
