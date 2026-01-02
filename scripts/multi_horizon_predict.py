@@ -46,6 +46,61 @@ flags.DEFINE_string(
     "Directory to save prediction results.",
 )
 flags.DEFINE_integer("batch_size", 1, "Batch size for predictions.")
+flags.DEFINE_integer(
+    "n_cov_samples",
+    128,
+    "Number of action samples to estimate the covariance (per timestep).",
+)
+flags.DEFINE_integer(
+    "control_dof_k",
+    2,
+    "Rank k of the basis used in the linear-system reconstruction test.",
+)
+flags.DEFINE_float(
+    "cov_eps",
+    1e-6,
+    "Jitter for numerical stability when estimating covariance and eigendecomposing.",
+)
+
+
+def estimate_cov_from_samples(samples: np.ndarray, eps: float) -> np.ndarray:
+    """
+    samples: (n_samples, action_dim)
+    returns: (action_dim, action_dim) covariance
+    """
+    X = samples - samples.mean(axis=0, keepdims=True)
+    # Unbiased covariance (n-1)
+    cov = (X.T @ X) / max(1, (X.shape[0] - 1))
+    cov = cov + eps * np.eye(cov.shape[0])
+    return cov
+
+
+def lowrank_basis_from_cov(cov: np.ndarray, k: int, eps: float) -> np.ndarray:
+    """
+    cov: (d, d) SPD
+    returns: B = U_k * sqrt(Lambda_k) of shape (d, k)
+    """
+    # eigh returns ascending eigenvalues
+    evals, evecs = np.linalg.eigh(cov)
+    evals = np.clip(evals, a_min=0.0, a_max=None)
+
+    k = min(k, cov.shape[0])
+    top_idx = np.argsort(evals)[-k:]  # indices of top-k eigenvalues
+    U = evecs[:, top_idx]             # (d, k)
+    lam = evals[top_idx]              # (k,)
+    B = U * np.sqrt(lam + eps)[None, :]  # (d, k)
+    return B
+
+
+def reconstruct_actions_linear_system(B: np.ndarray, a_true: np.ndarray) -> np.ndarray:
+    """
+    B: (d, k)
+    a_true: (d,)
+    returns: a_hat = B z*, where z* solves least squares
+    """
+    z, _, _, _ = np.linalg.lstsq(B, a_true, rcond=None)
+    a_hat = B @ z
+    return a_hat
 
 
 def run_predictions_for_model(
@@ -151,9 +206,19 @@ def run_predictions_for_model(
     all_ground_truth = []
     all_observations = []
     
+    # Collect reconstruction metrics across all batches
+    all_recon_mse = []
+    all_recon_mae = []
+    
     rng = jax.random.PRNGKey(42)
     
+    # Get parameters for covariance estimation and reconstruction
+    n_samples = FLAGS.n_cov_samples
+    k = FLAGS.control_dof_k
+    cov_eps = FLAGS.cov_eps
+    
     logging.info(f"Running predictions on {num_trajectories} trajectories (processing timestep by timestep)...")
+    logging.info(f"Using {n_samples} samples for covariance estimation, rank-{k} basis for reconstruction")
     for batch_idx, (batch, batch_pred) in enumerate(zip(data_iter, data_iter_pred)):
         # Process observations (use training horizon dataset for model input)
         # Now observations should be (batch, window_size, ...) instead of (batch, traj_len, window_size, ...)
@@ -199,15 +264,19 @@ def run_predictions_for_model(
             # Default task if no language instruction
             tasks = model.create_tasks(texts=["perform task"])
         
-        # Sample actions (model will predict with training_horizon)
-        rng, sample_rng = jax.random.split(rng)
-        predicted_actions = model.sample_actions(
-            observations,
-            tasks,
-            rng=sample_rng,
-            train=False,
-        )
-        predicted_actions = np.array(predicted_actions)
+        # --- Estimate covariance from multiple action samples (per timestep) ---
+        # Collect samples: (n_samples, batch, train_horizon, action_dim)
+        samples_list = []
+        rng_current = rng
+        for _ in range(n_samples):
+            rng_current, sample_rng = jax.random.split(rng_current)
+            s = model.sample_actions(observations, tasks, rng=sample_rng, train=False)
+            samples_list.append(np.array(s))
+        rng = rng_current
+        samples = np.stack(samples_list, axis=0)
+        
+        # We'll also keep one representative prediction (e.g., mean over samples) for your original MSE/MAE
+        predicted_actions = samples.mean(axis=0)  # (batch, train_horizon, action_dim)
         
         # Get ground truth actions (from prediction horizon dataset)
         ground_truth_actions = np.array(batch_pred["action"])
@@ -234,6 +303,38 @@ def run_predictions_for_model(
                 # Model predicts more steps - truncate to prediction horizon
                 predicted_actions = predicted_actions[..., :prediction_horizon, :]
         
+        # --- Linear-system reconstruction test (low-rank basis) ---
+        # For each batch item, estimate cov from samples at a single horizon step (shared cov in your head anyway),
+        # then build B (d x k) and reconstruct each ground-truth action vector.
+        batch_size_local = ground_truth_actions.shape[0]
+        pred_h = ground_truth_actions.shape[1]
+        action_dim = ground_truth_actions.shape[2]
+        
+        recon_mse_list = []
+        recon_mae_list = []
+        
+        for b in range(batch_size_local):
+            # Use horizon step 0 samples to estimate covariance of actions
+            # samples shape: (n_samples, batch, train_horizon, action_dim)
+            # If train_horizon != prediction_horizon, we still estimate covariance from available train_horizon samples.
+            samples_b = samples[:, b, 0, :]  # (n_samples, action_dim)
+            
+            cov = estimate_cov_from_samples(samples_b, eps=cov_eps)
+            B = lowrank_basis_from_cov(cov, k=k, eps=cov_eps)  # (action_dim, k)
+            
+            # Reconstruct each GT step in prediction horizon
+            for h in range(pred_h):
+                a_true = ground_truth_actions[b, h, :]  # (action_dim,)
+                a_hat = reconstruct_actions_linear_system(B, a_true)
+                
+                recon_mse_list.append(np.mean((a_hat - a_true) ** 2))
+                recon_mae_list.append(np.mean(np.abs(a_hat - a_true)))
+        
+        # Store reconstruction metrics for this batch
+        if recon_mse_list:
+            all_recon_mse.extend(recon_mse_list)
+            all_recon_mae.extend(recon_mae_list)
+        
         # Store results
         all_predictions.append(predicted_actions)
         all_ground_truth.append(ground_truth_actions)
@@ -252,6 +353,10 @@ def run_predictions_for_model(
     mse = np.mean((predictions - ground_truth) ** 2)
     mae = np.mean(np.abs(predictions - ground_truth))
     
+    # Compute reconstruction metrics (averaged over all timesteps processed)
+    recon_mse = float(np.mean(all_recon_mse)) if all_recon_mse else 0.0
+    recon_mae = float(np.mean(all_recon_mae)) if all_recon_mae else 0.0
+    
     # Save results
     results = {
         "training_horizon": training_horizon,
@@ -259,6 +364,10 @@ def run_predictions_for_model(
         "num_trajectories": num_trajectories,
         "mse": float(mse),
         "mae": float(mae),
+        "recon_mse": recon_mse,
+        "recon_mae": recon_mae,
+        "control_dof_k": k,
+        "n_cov_samples": n_samples,
         "predictions_shape": list(predictions.shape),
         "ground_truth_shape": list(ground_truth.shape),
     }
@@ -285,7 +394,9 @@ def run_predictions_for_model(
     logging.info(
         f"Results saved to {output_subdir}\n"
         f"  MSE: {mse:.6f}\n"
-        f"  MAE: {mae:.6f}"
+        f"  MAE: {mae:.6f}\n"
+        f"  Recon MSE (basis-fit): {recon_mse:.6f}\n"
+        f"  Recon MAE (basis-fit): {recon_mae:.6f}"
     )
     
     return results
@@ -340,19 +451,21 @@ def main(_):
         json.dump(all_results, f, indent=2)
     
     # Print summary table
-    logging.info("\n" + "="*60)
+    logging.info("\n" + "="*80)
     logging.info("SUMMARY")
-    logging.info("="*60)
-    logging.info(f"{'Train H':<10} {'Pred H':<10} {'MSE':<15} {'MAE':<15}")
-    logging.info("-" * 60)
+    logging.info("="*80)
+    logging.info(f"{'Train H':<10} {'Pred H':<10} {'MSE':<15} {'MAE':<15} {'Recon MSE':<15} {'Recon MAE':<15}")
+    logging.info("-" * 80)
     for r in all_results:
         logging.info(
             f"{r['training_horizon']:<10} "
             f"{r['prediction_horizon']:<10} "
             f"{r['mse']:<15.6f} "
-            f"{r['mae']:<15.6f}"
+            f"{r['mae']:<15.6f} "
+            f"{r['recon_mse']:<15.6f} "
+            f"{r['recon_mae']:<15.6f}"
         )
-    logging.info("="*60)
+    logging.info("="*80)
     logging.info(f"All results saved to {FLAGS.output_dir}")
 
 

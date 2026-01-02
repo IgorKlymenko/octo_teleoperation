@@ -5,11 +5,24 @@ This script loads saved predictions and creates visualizations comparing
 predicted actions to ground truth actions.
 """
 
-from absl import app, flags, logging
-import numpy as np
-import matplotlib.pyplot as plt
-import json
+# CRITICAL: Set matplotlib backend BEFORE any other imports
+# This must be the first thing after the docstring to prevent matplotlib
+# from reading an invalid MPLBACKEND environment variable
 import os
+# Delete invalid backend setting if it exists (Jupyter notebook backends)
+if 'MPLBACKEND' in os.environ:
+    backend_value = os.environ.get('MPLBACKEND', '')
+    # If it's the problematic Jupyter backend, remove it
+    if 'matplotlib_inline' in backend_value or 'inline' in backend_value:
+        del os.environ['MPLBACKEND']
+
+from absl import app, flags, logging
+import matplotlib
+# Explicitly set backend after import but before pyplot
+matplotlib.use('Agg')  # Non-interactive backend for saving files
+import matplotlib.pyplot as plt
+import numpy as np
+import json
 from pathlib import Path
 
 FLAGS = flags.FLAGS
@@ -58,17 +71,22 @@ def visualize_trajectory(
     
     Args:
         predictions: Array of shape (traj_len, action_horizon, action_dim) or (traj_len, action_dim)
-        ground_truth: Array of shape (traj_len, action_horizon, action_dim) or (traj_len, action_dim)
+        ground_truth: Array of shape (traj_len, window_size, action_horizon, action_dim) or (traj_len, action_horizon, action_dim) or (traj_len, action_dim)
         action_dim_labels: List of labels for each action dimension
         title: Title for the plot
         save_path: Path to save the plot (optional)
         show: Whether to display the plot
     """
-    # Handle different shapes - if action_horizon dimension exists, take first action
+    # Handle different shapes
+    # Ground truth might have window_size dimension: (traj_len, window_size, action_horizon, action_dim)
+    if ground_truth.ndim == 4:
+        ground_truth = ground_truth[:, 0, :, :]  # Remove window_size dimension: (traj_len, action_horizon, action_dim)
+    
+    # Handle action_horizon dimension - take first action from horizon
     if predictions.ndim == 3:
-        predictions = predictions[:, 0, :]  # Take first action from horizon
+        predictions = predictions[:, 0, :]  # Take first action from horizon: (traj_len, action_dim)
     if ground_truth.ndim == 3:
-        ground_truth = ground_truth[:, 0, :]  # Take first action from horizon
+        ground_truth = ground_truth[:, 0, :]  # Take first action from horizon: (traj_len, action_dim)
     
     traj_len, action_dim = predictions.shape
     n_dims = min(action_dim, len(action_dim_labels))
@@ -101,6 +119,25 @@ def visualize_trajectory(
             alpha=0.7,
             linestyle="--",
         )
+        
+        # Add trendline for predicted actions (moving average)
+        if traj_len > 5:
+            window_size = max(5, traj_len // 20)  # Adaptive window size
+            if window_size % 2 == 0:
+                window_size += 1  # Make odd for symmetric smoothing
+            # Use convolution for moving average
+            kernel = np.ones(window_size) / window_size
+            trendline = np.convolve(predictions[:, dim], kernel, mode='same')
+            ax.plot(
+                time_steps,
+                trendline,
+                label="Predicted Trend",
+                linewidth=2.5,
+                alpha=0.9,
+                linestyle="-",
+                color='red',
+            )
+        
         ax.set_ylabel(action_dim_labels[dim], fontsize=10)
         ax.grid(True, alpha=0.3)
         ax.legend(loc="upper right")
@@ -132,13 +169,18 @@ def visualize_trajectory_summary(
     
     Args:
         predictions: Array of shape (traj_len, action_horizon, action_dim) or (traj_len, action_dim)
-        ground_truth: Array of shape (traj_len, action_horizon, action_dim) or (traj_len, action_dim)
+        ground_truth: Array of shape (traj_len, window_size, action_horizon, action_dim) or (traj_len, action_horizon, action_dim) or (traj_len, action_dim)
         action_dim_labels: List of labels for each action dimension
         title: Title for the plot
         save_path: Path to save the plot (optional)
         show: Whether to display the plot
     """
     # Handle different shapes
+    # Ground truth might have window_size dimension
+    if ground_truth.ndim == 4:
+        ground_truth = ground_truth[:, 0, :, :]  # Remove window_size dimension
+    
+    # Handle action_horizon dimension
     if predictions.ndim == 3:
         predictions = predictions[:, 0, :]
     if ground_truth.ndim == 3:
@@ -184,6 +226,25 @@ def visualize_trajectory_summary(
             alpha=0.7,
             linestyle="--",
         )
+        
+        # Add trendline for predicted actions (moving average)
+        if traj_len > 5:
+            window_size = max(5, traj_len // 20)  # Adaptive window size
+            if window_size % 2 == 0:
+                window_size += 1  # Make odd for symmetric smoothing
+            # Use convolution for moving average
+            kernel = np.ones(window_size) / window_size
+            trendline = np.convolve(predictions[:, dim], kernel, mode='same')
+            ax.plot(
+                time_steps,
+                trendline,
+                label="Predicted Trend",
+                linewidth=2.5,
+                alpha=0.9,
+                linestyle="-",
+                color='red',
+            )
+        
         ax.set_ylabel(action_dim_labels[dim], fontsize=10)
         ax.set_title(f"Action Dim {dim}: {action_dim_labels[dim]}", fontsize=12)
         ax.grid(True, alpha=0.3)
@@ -259,31 +320,71 @@ def main(_):
         os.makedirs(vis_dir, exist_ok=True)
         
         # Determine number of trajectories to visualize
-        if predictions.ndim >= 3:
-            # Shape might be (num_trajs, traj_len, ...) or (traj_len, ...)
-            if predictions.shape[0] > 1 and predictions.shape[1] < 1000:
-                # Likely (num_trajs, traj_len, ...)
-                num_trajs = min(predictions.shape[0], FLAGS.max_trajectories)
-                traj_len = predictions.shape[1]
-            else:
-                # Likely (traj_len, ...) - single trajectory
-                num_trajs = 1
-                traj_len = predictions.shape[0]
+        # Predictions shape: (timesteps, action_horizon, action_dim) or (timesteps, action_dim)
+        # Ground truth shape: (timesteps, window_size, action_horizon, action_dim) or similar
+        
+        # Check if this is a single long trajectory or multiple trajectories
+        # If first dimension is large (>100) and second is small (<20), it's likely a single trajectory
+        # Otherwise, it might be multiple trajectories
+        
+        pred_shape = predictions.shape
+        gt_shape = ground_truth.shape
+        
+        # Handle ground truth window_size dimension
+        if len(gt_shape) == 4:
+            # (timesteps, window_size, action_horizon, action_dim)
+            gt_timesteps = gt_shape[0]
+        elif len(gt_shape) == 3:
+            # (timesteps, action_horizon, action_dim)
+            gt_timesteps = gt_shape[0]
         else:
-            num_trajs = 1
-            traj_len = predictions.shape[0]
+            gt_timesteps = gt_shape[0]
         
-        logging.info(f"  Visualizing {num_trajs} trajectory(ies)")
+        # For predictions: (timesteps, action_horizon, action_dim) or (timesteps, action_dim)
+        pred_timesteps = pred_shape[0]
         
-        # Visualize each trajectory
+        # If we have many timesteps, treat as a single long trajectory
+        # Otherwise, might be multiple trajectories
+        if pred_timesteps > 100:
+            # Single long trajectory - visualize segments of it
+            num_trajs = FLAGS.max_trajectories
+            traj_len = pred_timesteps
+            segment_size = traj_len // num_trajs if num_trajs > 1 else traj_len
+        else:
+            # Might be multiple trajectories
+            num_trajs = min(pred_timesteps, FLAGS.max_trajectories)
+            traj_len = 1  # Each is a single timestep
+            segment_size = 1
+        
+        logging.info(f"  Visualizing {num_trajs} trajectory segment(s) from {pred_timesteps} total timesteps")
+        
+        # Visualize trajectory segments
         for traj_idx in range(num_trajs):
-            if num_trajs > 1:
-                pred_traj = predictions[traj_idx]
-                gt_traj = ground_truth[traj_idx]
-                traj_suffix = f"_traj{traj_idx}"
+            if num_trajs > 1 and pred_timesteps > 100:
+                # Extract a segment from the long trajectory
+                start_idx = traj_idx * segment_size
+                end_idx = min(start_idx + segment_size, pred_timesteps)
+                pred_traj = predictions[start_idx:end_idx]
+                
+                # Handle ground truth shape
+                if len(gt_shape) == 4:
+                    gt_traj = ground_truth[start_idx:end_idx, 0, :, :]  # Remove window_size
+                elif len(gt_shape) == 3:
+                    gt_traj = ground_truth[start_idx:end_idx]
+                else:
+                    gt_traj = ground_truth[start_idx:end_idx]
+                
+                traj_suffix = f"_segment{traj_idx}"
             else:
+                # Use full trajectory
                 pred_traj = predictions
-                gt_traj = ground_truth
+                
+                # Handle ground truth shape
+                if len(gt_shape) == 4:
+                    gt_traj = ground_truth[:, 0, :, :]  # Remove window_size
+                else:
+                    gt_traj = ground_truth
+                
                 traj_suffix = ""
             
             # Individual trajectory plot
