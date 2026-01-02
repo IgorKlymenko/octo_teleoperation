@@ -201,17 +201,26 @@ def run_predictions_for_model(
     
     # Get dataset iterators - unbatch trajectories to process timestep by timestep
     # The model expects (batch, window_size, ...) but dataset returns (batch, traj_len, window_size, ...)
+    # Note: We use batch_size=1 by default to avoid batch size mismatches
+    # If you want to use larger batches, ensure all observation keys have consistent batch dimensions
+    effective_batch_size = batch_size
+    if effective_batch_size > 1:
+        logging.warning(
+            f"Using batch_size={effective_batch_size}. "
+            f"If you encounter dimension mismatch errors, try batch_size=1."
+        )
+    
     data_iter = (
         dataset.take(num_trajectories)
         .unbatch()  # Unbatch trajectories: (traj_len, window_size, ...)
-        .batch(batch_size)  # Batch timesteps: (batch, window_size, ...)
+        .batch(effective_batch_size)  # Batch timesteps: (batch, window_size, ...)
         .iterator()
     )
     
     data_iter_pred = (
         dataset_pred.take(num_trajectories)
         .unbatch()  # Unbatch trajectories
-        .batch(batch_size)  # Batch timesteps
+        .batch(effective_batch_size)  # Batch timesteps
         .iterator()
     )
     
@@ -252,10 +261,45 @@ def run_predictions_for_model(
             logging.warning(f"Observations missing keys: {missing_keys}. This may cause errors.")
         
         # Filter observations to match expected format
+        # First, determine the actual batch size from observations
+        actual_batch_size = None
+        batch_sizes = {}
+        for key, value in observations.items():
+            if hasattr(value, 'shape') and len(value.shape) > 0:
+                bs = value.shape[0]
+                batch_sizes[key] = bs
+                if actual_batch_size is None:
+                    actual_batch_size = bs
+                elif bs != actual_batch_size:
+                    logging.warning(
+                        f"Inconsistent batch sizes: {key} has batch size {bs}, "
+                        f"expected {actual_batch_size}"
+                    )
+        
+        if actual_batch_size is None:
+            actual_batch_size = batch_size  # Fall back to flag value
+        
+        logging.debug(f"Detected batch size: {actual_batch_size} (from observation keys: {batch_sizes})")
+        
         filtered_observations = {}
         for key in expected_obs_keys:
             if key in observations:
-                filtered_observations[key] = observations[key]
+                obs_value = observations[key]
+                # Ensure consistent batch size
+                if hasattr(obs_value, 'shape') and len(obs_value.shape) > 0:
+                    if obs_value.shape[0] != actual_batch_size:
+                        logging.warning(
+                            f"Observation key '{key}' has batch size {obs_value.shape[0]}, "
+                            f"expected {actual_batch_size}. Broadcasting..."
+                        )
+                        # Broadcast or repeat to match batch size
+                        if obs_value.shape[0] == 1:
+                            # Repeat single item to match batch size
+                            obs_value = np.repeat(obs_value, actual_batch_size, axis=0)
+                        else:
+                            # Take first actual_batch_size items
+                            obs_value = obs_value[:actual_batch_size]
+                filtered_observations[key] = obs_value
             else:
                 # Use example batch value as fallback (this might not work for all cases)
                 logging.warning(f"Key {key} not in observations, using example batch value")
@@ -263,23 +307,61 @@ def run_predictions_for_model(
                 # Convert to numpy and broadcast to match batch size
                 if hasattr(example_value, 'shape'):
                     example_np = np.array(example_value)
-                    batch_size = list(observations.values())[0].shape[0] if observations else 1
                     # Broadcast to match batch size
                     filtered_observations[key] = np.broadcast_to(
                         example_np[None, ...],
-                        (batch_size,) + example_np.shape
+                        (actual_batch_size,) + example_np.shape
                     )
                 else:
                     filtered_observations[key] = np.array(example_value) if hasattr(example_value, '__array__') else example_value
         
+        # Final validation: ensure all observation keys have the same batch size
+        for key, value in filtered_observations.items():
+            if hasattr(value, 'shape') and len(value.shape) > 0:
+                if value.shape[0] != actual_batch_size:
+                    logging.error(
+                        f"Observation key '{key}' has batch size {value.shape[0]}, "
+                        f"expected {actual_batch_size}. Shape: {value.shape}"
+                    )
+                    # Try to fix by broadcasting or truncating
+                    if value.shape[0] == 1 and actual_batch_size > 1:
+                        # Broadcast single item
+                        filtered_observations[key] = np.repeat(value, actual_batch_size, axis=0)
+                        logging.info(f"Broadcasted '{key}' from batch size 1 to {actual_batch_size}")
+                    elif value.shape[0] > actual_batch_size:
+                        # Truncate
+                        filtered_observations[key] = value[:actual_batch_size]
+                        logging.info(f"Truncated '{key}' from batch size {value.shape[0]} to {actual_batch_size}")
+                    else:
+                        raise ValueError(
+                            f"Cannot fix batch size mismatch for '{key}': "
+                            f"got {value.shape[0]}, expected {actual_batch_size}"
+                        )
+        
         observations = filtered_observations
         
         # Create tasks (using language instructions from batch if available)
+        # Ensure tasks match the observation batch size
         if "task" in batch and "language" in batch["task"]:
-            tasks = model.create_tasks(texts=batch["task"]["language"].tolist())
+            task_texts = batch["task"]["language"]
+            if hasattr(task_texts, 'tolist'):
+                task_texts = task_texts.tolist()
+            # Ensure we have the right number of tasks
+            if len(task_texts) != actual_batch_size:
+                if len(task_texts) == 1:
+                    # Repeat single task for all batch items
+                    task_texts = task_texts * actual_batch_size
+                    logging.debug(f"Repeated single task text to match batch size {actual_batch_size}")
+                else:
+                    # Take first actual_batch_size tasks
+                    task_texts = task_texts[:actual_batch_size]
+                    logging.debug(f"Truncated task texts to match batch size {actual_batch_size}")
+            tasks = model.create_tasks(texts=task_texts)
         else:
-            # Default task if no language instruction
-            tasks = model.create_tasks(texts=["perform task"])
+            # Default task if no language instruction - repeat for batch size
+            tasks = model.create_tasks(texts=["perform task"] * actual_batch_size)
+        
+        logging.debug(f"Created tasks for batch size {actual_batch_size}")
         
         # --- Estimate covariance from multiple action samples (per timestep) ---
         # Collect samples: (n_samples, batch, train_horizon, action_dim)
@@ -307,6 +389,11 @@ def run_predictions_for_model(
         # Get ground truth actions (from prediction horizon dataset)
         ground_truth_actions = np.array(batch_pred["action"])
         
+        # Handle potential extra dimension: squeeze if shape is (batch, 1, horizon, action_dim)
+        if len(ground_truth_actions.shape) == 4 and ground_truth_actions.shape[1] == 1:
+            ground_truth_actions = ground_truth_actions.squeeze(axis=1)  # (batch, horizon, action_dim)
+            logging.debug(f"Squeezed ground truth actions from {batch_pred['action'].shape} to {ground_truth_actions.shape}")
+        
         # Handle horizon mismatch: if training_horizon != prediction_horizon
         if training_horizon != prediction_horizon:
             if training_horizon < prediction_horizon:
@@ -332,65 +419,102 @@ def run_predictions_for_model(
         # --- Linear-system reconstruction test (low-rank basis) ---
         # For each batch item, estimate cov from samples at a single horizon step (shared cov in your head anyway),
         # then build B (d x k) and reconstruct each ground-truth action vector.
-        batch_size_local = ground_truth_actions.shape[0]
-        pred_h = ground_truth_actions.shape[1]
-        action_dim = ground_truth_actions.shape[2]
         
-        # Debug: log shapes
-        logging.debug(f"Samples shape: {samples.shape}")
-        logging.debug(f"Ground truth actions shape: {ground_truth_actions.shape}")
-        logging.debug(f"Action dim: {action_dim}, k: {k}")
-        
-        recon_mse_list = []
-        recon_mae_list = []
-        
-        for b in range(batch_size_local):
-            # Use horizon step 0 samples to estimate covariance of actions
-            # samples shape: (n_samples, batch, train_horizon, action_dim)
-            # If train_horizon != prediction_horizon, we still estimate covariance from available train_horizon samples.
-            samples_b = samples[:, b, 0, :]  # (n_samples, action_dim)
+        # Ensure ground_truth_actions has the expected 3D shape (batch, horizon, action_dim)
+        if len(ground_truth_actions.shape) != 3:
+            logging.error(
+                f"Expected ground_truth_actions to have shape (batch, horizon, action_dim), "
+                f"but got shape {ground_truth_actions.shape}. Skipping reconstruction."
+            )
+            recon_mse_list = []
+            recon_mae_list = []
+        else:
+            batch_size_local = ground_truth_actions.shape[0]
+            pred_h = ground_truth_actions.shape[1]
+            action_dim = ground_truth_actions.shape[2]
             
-            # Ensure samples_b is properly shaped
-            samples_b = np.array(samples_b)
-            if len(samples_b.shape) == 1:
-                # If somehow we got 1D, reshape it
-                samples_b = samples_b.reshape(-1, action_dim)
+            # Debug: log shapes
+            logging.debug(f"Samples shape: {samples.shape}")
+            logging.debug(f"Ground truth actions shape: {ground_truth_actions.shape}")
+            logging.debug(f"Action dim: {action_dim}, k: {k}, pred_h: {pred_h}, batch_size: {batch_size_local}")
             
-            cov = estimate_cov_from_samples(samples_b, eps=cov_eps)
-            B = lowrank_basis_from_cov(cov, k=k, eps=cov_eps)  # (action_dim, k)
+            recon_mse_list = []
+            recon_mae_list = []
             
-            # Ensure B has correct shape
-            B = np.array(B)
-            if B.shape[0] != action_dim:
-                logging.warning(
-                    f"Basis B has unexpected shape: {B.shape}, expected ({action_dim}, {k}). "
-                    f"Transposing if needed..."
+            for b in range(batch_size_local):
+                # Use horizon step 0 samples to estimate covariance of actions
+                # samples shape: (n_samples, batch, train_horizon, action_dim)
+                # If train_horizon != prediction_horizon, we still estimate covariance from available train_horizon samples.
+                samples_b = samples[:, b, 0, :]  # (n_samples, action_dim)
+                
+                # Ensure samples_b is properly shaped
+                samples_b = np.array(samples_b)
+                if len(samples_b.shape) == 1:
+                    # If somehow we got 1D, reshape it
+                    samples_b = samples_b.reshape(-1, action_dim)
+                elif samples_b.shape[1] != action_dim:
+                    logging.warning(
+                        f"Samples for batch {b} have action_dim={samples_b.shape[1]}, "
+                        f"but ground truth has action_dim={action_dim}. "
+                        f"Expected samples shape: (n_samples, {action_dim}), got {samples_b.shape}"
+                    )
+                    continue
+                
+                cov = estimate_cov_from_samples(samples_b, eps=cov_eps)
+                B = lowrank_basis_from_cov(cov, k=k, eps=cov_eps)  # (action_dim, k)
+                
+                # Ensure B has correct shape
+                B = np.array(B)
+                if B.shape[0] != action_dim:
+                    logging.warning(
+                        f"Basis B has unexpected shape: {B.shape}, expected ({action_dim}, {k}). "
+                        f"Transposing if needed..."
+                    )
+                    if B.shape[1] == action_dim:
+                        B = B.T
+                
+                # Verify B shape after potential transpose
+                if B.shape[0] != action_dim:
+                    logging.warning(
+                        f"Basis B still has wrong shape after transpose: {B.shape}, "
+                        f"expected ({action_dim}, {k}). Skipping batch {b}."
+                    )
+                    continue
+                
+                # Reconstruct each GT step in prediction horizon
+                for h in range(pred_h):
+                    a_true = np.array(ground_truth_actions[b, h, :]).flatten()  # (action_dim,)
+                    
+                    # Ensure dimensions match
+                    if len(a_true) != action_dim:
+                        logging.warning(
+                            f"Skipping reconstruction at batch={b}, horizon={h}: "
+                            f"a_true.shape={a_true.shape}, expected ({action_dim},)"
+                        )
+                        continue
+                    
+                    try:
+                        a_hat = reconstruct_actions_linear_system(B, a_true)
+                        recon_mse_list.append(np.mean((a_hat - a_true) ** 2))
+                        recon_mae_list.append(np.mean(np.abs(a_hat - a_true)))
+                    except (ValueError, np.linalg.LinAlgError) as e:
+                        logging.warning(
+                            f"Failed to reconstruct action at batch={b}, horizon={h}: {e}. "
+                            f"B.shape={B.shape}, a_true.shape={a_true.shape}"
+                        )
+                        continue
+            
+            if recon_mse_list:
+                logging.debug(
+                    f"Computed {len(recon_mse_list)} reconstruction metrics "
+                    f"(batch_size={batch_size_local}, pred_h={pred_h})"
                 )
-                if B.shape[1] == action_dim:
-                    B = B.T
-            
-            # Reconstruct each GT step in prediction horizon
-            for h in range(pred_h):
-                a_true = np.array(ground_truth_actions[b, h, :]).flatten()  # (action_dim,)
-                
-                # Ensure dimensions match
-                if len(a_true) != action_dim:
-                    logging.warning(
-                        f"Skipping reconstruction: a_true.shape={a_true.shape}, "
-                        f"expected ({action_dim},)"
-                    )
-                    continue
-                
-                try:
-                    a_hat = reconstruct_actions_linear_system(B, a_true)
-                    recon_mse_list.append(np.mean((a_hat - a_true) ** 2))
-                    recon_mae_list.append(np.mean(np.abs(a_hat - a_true)))
-                except (ValueError, np.linalg.LinAlgError) as e:
-                    logging.warning(
-                        f"Failed to reconstruct action at batch={b}, horizon={h}: {e}. "
-                        f"B.shape={B.shape}, a_true.shape={a_true.shape}"
-                    )
-                    continue
+            else:
+                logging.warning(
+                    f"No reconstruction metrics computed! "
+                    f"Check shapes: samples={samples.shape}, "
+                    f"ground_truth={ground_truth_actions.shape}"
+                )
         
         # Store reconstruction metrics for this batch
         if recon_mse_list:
