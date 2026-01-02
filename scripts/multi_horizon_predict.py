@@ -98,7 +98,24 @@ def reconstruct_actions_linear_system(B: np.ndarray, a_true: np.ndarray) -> np.n
     a_true: (d,)
     returns: a_hat = B z*, where z* solves least squares
     """
-    z, _, _, _ = np.linalg.lstsq(B, a_true, rcond=None)
+    # Ensure B is 2D and a_true is 1D
+    B = np.atleast_2d(B)
+    if B.shape[0] < B.shape[1]:
+        # If B is (k, d) instead of (d, k), transpose it
+        B = B.T
+    
+    a_true = np.atleast_1d(a_true).flatten()
+    
+    # Check dimensions
+    if B.shape[0] != a_true.shape[0]:
+        raise ValueError(
+            f"Incompatible dimensions: B.shape={B.shape}, a_true.shape={a_true.shape}. "
+            f"Expected B.shape[0] == a_true.shape[0]"
+        )
+    
+    # Solve least squares: B @ z = a_true
+    # B is (d, k), a_true is (d,), so we need to solve for z (k,)
+    z, residuals, rank, s = np.linalg.lstsq(B, a_true, rcond=None)
     a_hat = B @ z
     return a_hat
 
@@ -271,9 +288,18 @@ def run_predictions_for_model(
         for _ in range(n_samples):
             rng_current, sample_rng = jax.random.split(rng_current)
             s = model.sample_actions(observations, tasks, rng=sample_rng, train=False)
-            samples_list.append(np.array(s))
+            s_array = np.array(s)
+            # Handle potential sample_shape dimension: if s has shape (sample_shape, batch, horizon, action_dim)
+            # we'll take the first sample or flatten
+            if len(s_array.shape) == 4 and s_array.shape[0] > 1:
+                # Has sample_shape dimension, take first sample
+                s_array = s_array[0]
+            samples_list.append(s_array)
         rng = rng_current
         samples = np.stack(samples_list, axis=0)
+        
+        # Log actual shape for debugging
+        logging.debug(f"Stacked samples shape: {samples.shape}")
         
         # We'll also keep one representative prediction (e.g., mean over samples) for your original MSE/MAE
         predicted_actions = samples.mean(axis=0)  # (batch, train_horizon, action_dim)
@@ -310,6 +336,11 @@ def run_predictions_for_model(
         pred_h = ground_truth_actions.shape[1]
         action_dim = ground_truth_actions.shape[2]
         
+        # Debug: log shapes
+        logging.debug(f"Samples shape: {samples.shape}")
+        logging.debug(f"Ground truth actions shape: {ground_truth_actions.shape}")
+        logging.debug(f"Action dim: {action_dim}, k: {k}")
+        
         recon_mse_list = []
         recon_mae_list = []
         
@@ -319,16 +350,47 @@ def run_predictions_for_model(
             # If train_horizon != prediction_horizon, we still estimate covariance from available train_horizon samples.
             samples_b = samples[:, b, 0, :]  # (n_samples, action_dim)
             
+            # Ensure samples_b is properly shaped
+            samples_b = np.array(samples_b)
+            if len(samples_b.shape) == 1:
+                # If somehow we got 1D, reshape it
+                samples_b = samples_b.reshape(-1, action_dim)
+            
             cov = estimate_cov_from_samples(samples_b, eps=cov_eps)
             B = lowrank_basis_from_cov(cov, k=k, eps=cov_eps)  # (action_dim, k)
             
+            # Ensure B has correct shape
+            B = np.array(B)
+            if B.shape[0] != action_dim:
+                logging.warning(
+                    f"Basis B has unexpected shape: {B.shape}, expected ({action_dim}, {k}). "
+                    f"Transposing if needed..."
+                )
+                if B.shape[1] == action_dim:
+                    B = B.T
+            
             # Reconstruct each GT step in prediction horizon
             for h in range(pred_h):
-                a_true = ground_truth_actions[b, h, :]  # (action_dim,)
-                a_hat = reconstruct_actions_linear_system(B, a_true)
+                a_true = np.array(ground_truth_actions[b, h, :]).flatten()  # (action_dim,)
                 
-                recon_mse_list.append(np.mean((a_hat - a_true) ** 2))
-                recon_mae_list.append(np.mean(np.abs(a_hat - a_true)))
+                # Ensure dimensions match
+                if len(a_true) != action_dim:
+                    logging.warning(
+                        f"Skipping reconstruction: a_true.shape={a_true.shape}, "
+                        f"expected ({action_dim},)"
+                    )
+                    continue
+                
+                try:
+                    a_hat = reconstruct_actions_linear_system(B, a_true)
+                    recon_mse_list.append(np.mean((a_hat - a_true) ** 2))
+                    recon_mae_list.append(np.mean(np.abs(a_hat - a_true)))
+                except (ValueError, np.linalg.LinAlgError) as e:
+                    logging.warning(
+                        f"Failed to reconstruct action at batch={b}, horizon={h}: {e}. "
+                        f"B.shape={B.shape}, a_true.shape={a_true.shape}"
+                    )
+                    continue
         
         # Store reconstruction metrics for this batch
         if recon_mse_list:

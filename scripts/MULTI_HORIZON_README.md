@@ -31,7 +31,7 @@ python scripts/multi_horizon_finetune.py \
 - `base_save_dir/horizon_8/` - Model finetuned for horizon 8
 
 ### 2. `multi_horizon_predict.py`
-Runs predictions for each model over each prediction horizon.
+Runs predictions for each model over each prediction horizon. Now includes **reconstruction metrics** that test whether the learned covariance geometry contains ground-truth actions.
 
 **Usage:**
 ```bash
@@ -42,8 +42,16 @@ python scripts/multi_horizon_predict.py \
     --prediction_horizons=1,4,8 \
     --num_trajectories=10 \
     --batch_size=1 \
-    --output_dir=/path/to/save/predictions
+    --output_dir=/path/to/save/predictions \
+    --n_cov_samples=128 \
+    --control_dof_k=2 \
+    --cov_eps=1e-6
 ```
+
+**New Flags:**
+- `--n_cov_samples`: Number of action samples to estimate covariance (default: 128)
+- `--control_dof_k`: Rank k of the low-rank basis for reconstruction test (default: 2)
+- `--cov_eps`: Numerical stability jitter (default: 1e-6)
 
 **Output:**
 - `output_dir/train_h1_pred_h1/` - Model trained on h1, predicting h1
@@ -54,8 +62,14 @@ python scripts/multi_horizon_predict.py \
 - `output_dir/summary.json` - Summary of all results
 
 Each prediction directory contains:
-- `metrics.json` - MSE, MAE, and other metrics
+- `metrics.json` - MSE, MAE, reconstruction MSE/MAE, and other metrics
 - `predictions.npz` - NumPy array with predictions and ground truth
+
+**Metrics Explained:**
+- **MSE/MAE**: Standard prediction error metrics
+- **recon_mse/recon_mae**: Reconstruction error using low-rank basis from learned covariance
+  - Low recon error → learned covariance geometry captures ground truth well
+  - High recon error → learned basis misses critical components or is too low-rank
 
 ### 3. `run_multi_horizon_experiment.py`
 Convenience script that runs both finetuning and prediction in sequence.
@@ -131,6 +145,23 @@ output_dir/
 ```
 
 ## Visualization
+
+### Plotting Training Metrics
+
+**Option 1: TensorBoard** (for `multi_horizon_finetune.py`)
+```bash
+tensorboard --logdir=./checkpoints/multi_horizon/horizon_1/tb
+```
+
+**Option 2: Plot from TensorBoard logs** (creates static plots)
+```bash
+python scripts/plot_training_metrics.py \
+    --logdir=./checkpoints/multi_horizon/horizon_1/tb \
+    --output_dir=./checkpoints/multi_horizon/horizon_1/training_plots \
+    --metrics=loss,mse,mae
+```
+
+### Plotting Prediction Results
 
 After running predictions, you can visualize the trajectories:
 
