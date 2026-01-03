@@ -6,6 +6,8 @@ This script runs the complete experiment pipeline:
 2. Run predictions for each model over each horizon (9 runs total)
 """
 
+
+### TEST CODE -- REFER TO COLLAB NOTEBOOK FOR ACTUAL CODE I USED ###
 from absl import app, flags, logging
 import subprocess
 import sys
